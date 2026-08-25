@@ -1,0 +1,23 @@
+MEGATRON GEMINI SETUP
+
+1. Create a .env file in the same folder as app.py.
+2. Add:
+
+GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+GEMINI_FAST_MODEL=gemini-2.5-flash-lite
+GEMINI_MODEL=gemini-2.5-flash
+MEGATRON_MAX_TOKENS=320
+TAVILY_API_KEY=YOUR_TAVILY_API_KEY
+XIAOZHI_MCP_URL=YOUR_XIAOZHI_MCP_URL
+MEGATRON_API_URL=http://127.0.0.1:8000/chat
+
+3. Install:
+   pip install -r requirements.txt
+
+4. Start:
+   python api.py
+
+5. Test:
+   Invoke-RestMethod -Uri "http://127.0.0.1:8000/chat" -Method POST -ContentType "application/json" -Body '{"message":"What is the capital of India?"}'
+
+The project uses Gemini as the AI provider. Groq is no longer required.
