@@ -2,25 +2,15 @@ import io
 import os
 import re
 import time
+from urllib.parse import quote
 
 import edge_tts
-
-from fastapi import (
-    FastAPI,
-    File,
-    UploadFile,
-    HTTPException,
-)
-
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-
-from pydantic import BaseModel
-
-from dotenv import load_dotenv
-from groq import Groq
-
 import uvicorn
+from fastapi import Body, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from groq import Groq
+from pydantic import BaseModel
 
 from app import process_message
 
@@ -29,21 +19,24 @@ from app import process_message
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
-
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 STT_MODEL = os.getenv(
     "GROQ_STT_MODEL",
-    "whisper-large-v3-turbo"
+    "whisper-large-v3-turbo",
 )
+
+TTS_VOICE = os.getenv(
+    "MEGATRON_TTS_VOICE",
+    "en-US-AriaNeural",
+)
+
 
 if not GROQ_API_KEY:
     raise RuntimeError(
-        "GROQ_API_KEY not found."
+        "GROQ_API_KEY not found in environment variables."
     )
+
 
 groq_client = Groq(
     api_key=GROQ_API_KEY
@@ -75,6 +68,80 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean_tts_text(text: str) -> str:
+    """
+    Remove common markdown characters so the spoken output
+    sounds cleaner.
+    """
+
+    if not text:
+        return ""
+
+    cleaned = str(text)
+
+    cleaned = re.sub(
+        r"[*_`#>-]",
+        "",
+        cleaned,
+    )
+
+    cleaned = cleaned.replace(
+        "\r",
+        " ",
+    )
+
+    cleaned = cleaned.replace(
+        "\n",
+        " ",
+    )
+
+    cleaned = re.sub(
+        r"\s+",
+        " ",
+        cleaned,
+    )
+
+    return cleaned.strip()
+
+
+def get_transcription(audio_bytes: bytes) -> str:
+    """
+    Send uploaded WAV/audio bytes to Groq Whisper.
+    """
+
+    if not audio_bytes:
+        raise ValueError("Audio data is empty.")
+
+    audio_file = io.BytesIO(audio_bytes)
+
+    audio_file.name = "megatron.wav"
+
+    transcription = groq_client.audio.transcriptions.create(
+        file=audio_file,
+        model=STT_MODEL,
+        response_format="json",
+    )
+
+    text = getattr(
+        transcription,
+        "text",
+        "",
+    )
+
+    text = str(text).strip()
+
+    if not text:
+        raise ValueError(
+            "Speech could not be transcribed."
+        )
+
+    return text
 
 
 # ============================================================
@@ -132,6 +199,14 @@ def chat(request: ChatRequest):
         )
 
         print(
+            f"[CHAT] {message}"
+        )
+
+        print(
+            f"[REPLY] {reply}"
+        )
+
+        print(
             f"[TIMING] api_chat={elapsed:.3f}s"
         )
 
@@ -140,7 +215,7 @@ def chat(request: ChatRequest):
             "reply": str(reply),
             "latency_seconds": round(
                 elapsed,
-                3
+                3,
             ),
         }
 
@@ -158,74 +233,65 @@ def chat(request: ChatRequest):
 
 
 # ============================================================
-# VOICE → TEXT → MEGATRON
+# VOICE
 # ============================================================
 
 @app.post("/voice")
 async def voice(
-    audio: UploadFile = File(...)
+    audio: bytes = Body(
+        ...,
+        media_type="audio/wav",
+    )
 ):
 
     started = time.perf_counter()
 
     try:
 
-        audio_bytes = await audio.read()
-
-        if not audio_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="Empty audio file.",
-            )
-
-        # Safety limit: about 1 MB
-        if len(audio_bytes) > 1_000_000:
-            raise HTTPException(
-                status_code=413,
-                detail="Audio file is too large.",
-            )
-
         print(
-            f"[VOICE] Received "
-            f"{len(audio_bytes)} bytes"
+            f"[VOICE] Received audio: {len(audio)} bytes"
         )
 
         # ----------------------------------------------------
-        # GROQ WHISPER
+        # 1. SPEECH -> TEXT
         # ----------------------------------------------------
 
-        transcription =
-            groq_client.audio.transcriptions.create(
-                file=(
-                    "megatron.wav",
-                    audio_bytes,
-                    "audio/wav",
-                ),
-                model=STT_MODEL,
-            )
-
-        transcript = str(
-            transcription.text
-        ).strip()
-
-        print(
-            "[VOICE] Transcript:",
-            transcript,
+        transcript = get_transcription(
+            audio
         )
 
-        if not transcript:
-
-            return {
-                "success": False,
-                "error": "No speech detected.",
-            }
+        print(
+            f"[STT] {transcript}"
+        )
 
         # ----------------------------------------------------
-        # EXISTING MEGATRON BRAIN
+        # 2. TEXT -> MEGATRON BRAIN
         # ----------------------------------------------------
 
         reply = process_message(
             transcript
+        )
+
+        reply = str(reply).strip()
+
+        print(
+            f"[AI] {reply}"
+        )
+
+        # ----------------------------------------------------
+        # 3. CREATE TTS URL
+        # ----------------------------------------------------
+
+        clean_reply = clean_tts_text(
+            reply
+        )
+
+        tts_url = (
+            "/tts?text="
+            + quote(
+                clean_reply,
+                safe="",
+            )
         )
 
         elapsed = (
@@ -240,15 +306,13 @@ async def voice(
         return {
             "success": True,
             "transcript": transcript,
-            "reply": str(reply),
+            "reply": reply,
+            "tts_url": tts_url,
             "latency_seconds": round(
                 elapsed,
-                3
+                3,
             ),
         }
-
-    except HTTPException:
-        raise
 
     except Exception as error:
 
@@ -264,85 +328,51 @@ async def voice(
 
 
 # ============================================================
-# TEXT → SPEECH
+# TTS
 # ============================================================
 
 @app.get("/tts")
-async def tts(text: str):
+async def tts(
+    text: str,
+):
 
-    text = str(
+    text = clean_tts_text(
         text
-    ).strip()
+    )
 
     if not text:
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty.",
-        )
+        return {
+            "success": False,
+            "error": "TTS text cannot be empty.",
+        }
 
-    # Keep the voice request compact.
-    text = text[:300]
+    # Keep accidental giant requests under control.
+    text = text[:1200]
 
-    # Devanagari → Hindi neural voice
-    # Otherwise use Indian English neural voice.
-    if re.search(
-        r"[\u0900-\u097F]",
-        text
-    ):
-        voice = "hi-IN-SwaraNeural"
-    else:
-        voice = "en-IN-NeerjaNeural"
-
-    print(
-        f"[TTS] Voice: {voice}"
+    output_path = (
+        f"/tmp/megatron_tts_{time.time_ns()}.mp3"
     )
 
     try:
 
         communicate = edge_tts.Communicate(
             text,
-            voice,
+            TTS_VOICE,
         )
 
-        audio_chunks = []
-
-        async for chunk in communicate.stream():
-
-            if (
-                chunk["type"]
-                == "audio"
-            ):
-                audio_chunks.append(
-                    chunk["data"]
-                )
-
-        audio_data = b"".join(
-            audio_chunks
+        await communicate.save(
+            output_path
         )
-
-        if not audio_data:
-            raise HTTPException(
-                status_code=500,
-                detail="TTS returned no audio.",
-            )
 
         print(
-            f"[TTS] Generated "
-            f"{len(audio_data)} bytes"
+            f"[TTS] Generated speech for: {text}"
         )
 
-        return StreamingResponse(
-            io.BytesIO(
-                audio_data
-            ),
+        return FileResponse(
+            output_path,
             media_type="audio/mpeg",
-            headers={
-                "Cache-Control": "no-store",
-            },
+            filename="megatron.mp3",
         )
-
-    except HTTPException:
-        raise
 
     except Exception as error:
 
@@ -351,10 +381,10 @@ async def tts(text: str):
             error,
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(error),
-        )
+        return {
+            "success": False,
+            "error": str(error),
+        }
 
 
 # ============================================================
@@ -366,5 +396,10 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
     )
