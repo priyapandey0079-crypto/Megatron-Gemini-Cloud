@@ -1,6 +1,4 @@
-import io
 import os
-import re
 import time
 from urllib.parse import quote
 
@@ -8,51 +6,20 @@ import edge_tts
 import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from groq import Groq
-from pydantic import BaseModel
+from fastapi.responses import Response
+from google import genai
+from google.genai import types
 
-from app import process_message
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+TTS_VOICE = os.getenv("MEGATRON_TTS_VOICE", "en-US-AriaNeural")
 
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY not found in environment variables.")
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-STT_MODEL = os.getenv(
-    "GROQ_STT_MODEL",
-    "whisper-large-v3-turbo",
-)
-
-TTS_VOICE = os.getenv(
-    "MEGATRON_TTS_VOICE",
-    "en-US-AriaNeural",
-)
-
-
-if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY not found in environment variables."
-    )
-
-
-groq_client = Groq(
-    api_key=GROQ_API_KEY
-)
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(
-    title="Megatron API",
-    version="2.0.0",
-)
-
-
+app = FastAPI(title="Megatron Gemini API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,345 +28,131 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SYSTEM_PROMPT = """
+You are Megatron, a natural AI voice assistant.
 
-# ============================================================
-# REQUEST MODEL
-# ============================================================
-
-class ChatRequest(BaseModel):
-    message: str
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def clean_tts_text(text: str) -> str:
-    """
-    Remove common markdown characters so the spoken output
-    sounds cleaner.
-    """
-
-    if not text:
-        return ""
-
-    cleaned = str(text)
-
-    cleaned = re.sub(
-        r"[*_`#>-]",
-        "",
-        cleaned,
-    )
-
-    cleaned = cleaned.replace(
-        "\r",
-        " ",
-    )
-
-    cleaned = cleaned.replace(
-        "\n",
-        " ",
-    )
-
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        cleaned,
-    )
-
-    return cleaned.strip()
+Personality:
+- Calm, intelligent, friendly, confident.
+- Speak naturally in Indian English/Hinglish.
+- Match the user's language.
+- Avoid robotic or overly formal wording.
+- For simple questions, answer directly in 1-3 short sentences.
+- Do not add unnecessary greetings.
+- Do not repeat the user's question.
+- Do not invent facts.
+- Be concise for voice responses.
+""".strip()
 
 
-def get_transcription(audio_bytes: bytes) -> str:
-    """
-    Send uploaded WAV/audio bytes to Groq Whisper.
-    """
+def clean_text(text: str) -> str:
+    text = str(text or "").strip().replace("\r", " ").replace("\n", " ")
+    return " ".join(text.split())
 
+
+def gemini_text(prompt: str) -> str:
+    response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    result = clean_text(getattr(response, "text", ""))
+    if not result:
+        raise RuntimeError("Gemini returned an empty response.")
+    return result
+
+
+def gemini_transcribe(audio_bytes: bytes) -> str:
     if not audio_bytes:
         raise ValueError("Audio data is empty.")
+    prompt = f"""
+{SYSTEM_PROMPT}
 
-    audio_file = io.BytesIO(audio_bytes)
-
-    audio_file.name = "megatron.wav"
-
-    transcription = groq_client.audio.transcriptions.create(
-        file=audio_file,
-        model=STT_MODEL,
-        response_format="json",
+Transcribe the following user's speech accurately.
+The user may speak Hindi, English, or Hinglish.
+Clean obvious speech-recognition mistakes when the intended wording is clear.
+Examples: 'capital gaya hai' -> 'capital kya hai'; 'news farch' -> 'news search'; 'system infomation' -> 'system information'.
+Return ONLY the cleaned transcription.
+""".strip()
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+        ],
     )
+    transcript = clean_text(getattr(response, "text", ""))
+    if not transcript:
+        raise RuntimeError("Gemini could not transcribe the audio.")
+    return transcript
 
-    text = getattr(
-        transcription,
-        "text",
-        "",
-    )
-
-    text = str(text).strip()
-
-    if not text:
-        raise ValueError(
-            "Speech could not be transcribed."
-        )
-
-    return text
-
-
-# ============================================================
-# ROOT
-# ============================================================
 
 @app.get("/")
 def root():
-    return {
-        "service": "Megatron API",
-        "status": "online",
-        "version": "2.0.0",
-    }
+    return {"service": "Megatron Gemini API", "status": "online", "version": "3.0.0"}
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-    }
+    return {"status": "ok", "service": "megatron-gemini"}
 
-
-# ============================================================
-# CHAT
-# ============================================================
 
 @app.post("/chat")
-def chat(request: ChatRequest):
-
-    message = str(
-        request.message
-    ).strip()
-
-    if not message:
-        return {
-            "success": False,
-            "error": "Message cannot be empty.",
-        }
-
+def chat(payload: dict = Body(...)):
     started = time.perf_counter()
-
+    message = clean_text(payload.get("message", "") if isinstance(payload, dict) else "")
+    if not message:
+        return {"success": False, "error": "Message cannot be empty."}
     try:
-
-        reply = process_message(
-            message
-        )
-
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        print(
-            f"[CHAT] {message}"
-        )
-
-        print(
-            f"[REPLY] {reply}"
-        )
-
-        print(
-            f"[TIMING] api_chat={elapsed:.3f}s"
-        )
-
-        return {
-            "success": True,
-            "reply": str(reply),
-            "latency_seconds": round(
-                elapsed,
-                3,
-            ),
-        }
-
+        reply = gemini_text(f"{SYSTEM_PROMPT}\n\nThe user said:\n\n{message}\n\nAnswer the user's request naturally.")
+        elapsed = time.perf_counter() - started
+        print(f"[CHAT] {message}")
+        print(f"[REPLY] {reply}")
+        print(f"[TIMING] {elapsed:.3f}s")
+        return {"success": True, "reply": reply, "latency_seconds": round(elapsed, 3)}
     except Exception as error:
+        print("[CHAT ERROR]", error)
+        return {"success": False, "error": str(error)}
 
-        print(
-            "[API ERROR]",
-            error,
-        )
-
-        return {
-            "success": False,
-            "error": str(error),
-        }
-
-
-# ============================================================
-# VOICE
-# ============================================================
 
 @app.post("/voice")
-async def voice(
-    audio: bytes = Body(
-        ...,
-        media_type="audio/wav",
-    )
-):
-
+async def voice(audio: bytes = Body(...)):
     started = time.perf_counter()
-
     try:
-
-        print(
-            f"[VOICE] Received audio: {len(audio)} bytes"
-        )
-
-        # ----------------------------------------------------
-        # 1. SPEECH -> TEXT
-        # ----------------------------------------------------
-
-        transcript = get_transcription(
-            audio
-        )
-
-        print(
-            f"[STT] {transcript}"
-        )
-
-        # ----------------------------------------------------
-        # 2. TEXT -> MEGATRON BRAIN
-        # ----------------------------------------------------
-
-        reply = process_message(
-            transcript
-        )
-
-        reply = str(reply).strip()
-
-        print(
-            f"[AI] {reply}"
-        )
-
-        # ----------------------------------------------------
-        # 3. CREATE TTS URL
-        # ----------------------------------------------------
-
-        clean_reply = clean_tts_text(
-            reply
-        )
-
-        tts_url = (
-            "/tts?text="
-            + quote(
-                clean_reply,
-                safe="",
-            )
-        )
-
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        print(
-            f"[TIMING] api_voice={elapsed:.3f}s"
-        )
-
-        return {
-            "success": True,
-            "transcript": transcript,
-            "reply": reply,
-            "tts_url": tts_url,
-            "latency_seconds": round(
-                elapsed,
-                3,
-            ),
-        }
-
+        if not audio:
+            return {"success": False, "error": "Audio data is empty."}
+        print(f"[VOICE] Received {len(audio)} bytes")
+        transcript = gemini_transcribe(audio)
+        print(f"[STT] {transcript}")
+        reply = gemini_text(f"You are Megatron.\n\n{SYSTEM_PROMPT}\n\nThe user's cleaned speech transcription is:\n\n{transcript}\n\nAnswer the user's request naturally.")
+        print(f"[AI] {reply}")
+        tts_url = "/tts?text=" + quote(reply, safe="")
+        elapsed = time.perf_counter() - started
+        print(f"[TIMING] voice={elapsed:.3f}s")
+        return {"success": True, "transcript": transcript, "reply": reply, "tts_url": tts_url, "latency_seconds": round(elapsed, 3)}
     except Exception as error:
+        print("[VOICE ERROR]", error)
+        return {"success": False, "error": str(error)}
 
-        print(
-            "[VOICE ERROR]",
-            error,
-        )
-
-        return {
-            "success": False,
-            "error": str(error),
-        }
-
-
-# ============================================================
-# TTS
-# ============================================================
 
 @app.get("/tts")
-async def tts(
-    text: str,
-):
-
-    text = clean_tts_text(
-        text
-    )
-
+async def tts(text: str):
+    text = clean_text(text)[:1200]
     if not text:
-        return {
-            "success": False,
-            "error": "TTS text cannot be empty.",
-        }
-
-    # Keep accidental giant requests under control.
-    text = text[:1200]
-
-    output_path = (
-        f"/tmp/megatron_tts_{time.time_ns()}.mp3"
-    )
-
+        return {"success": False, "error": "TTS text cannot be empty."}
     try:
-
-        communicate = edge_tts.Communicate(
-            text,
-            TTS_VOICE,
-        )
-
-        await communicate.save(
-            output_path
-        )
-
-        print(
-            f"[TTS] Generated speech for: {text}"
-        )
-
-        return FileResponse(
-            output_path,
+        communicator = edge_tts.Communicate(text, TTS_VOICE)
+        audio_chunks = []
+        async for chunk in communicator.stream():
+            if chunk["type"] == "audio":
+                audio_chunks.append(chunk["data"])
+        audio_data = b"".join(audio_chunks)
+        if not audio_data:
+            raise RuntimeError("TTS returned empty audio.")
+        return Response(
+            content=audio_data,
             media_type="audio/mpeg",
-            filename="megatron.mp3",
+            headers={"Content-Disposition": 'inline; filename="megatron.mp3"'},
         )
-
     except Exception as error:
+        print("[TTS ERROR]", error)
+        return {"success": False, "error": str(error)}
 
-        print(
-            "[TTS ERROR]",
-            error,
-        )
-
-        return {
-            "success": False,
-            "error": str(error),
-        }
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "8000",
-            )
-        ),
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
