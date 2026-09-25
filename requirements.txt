@@ -4,3 +4,5 @@ requests
 python-dotenv
 google-genai
 tavily
+python-multipart
+edge-tts
