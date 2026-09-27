@@ -6,3 +6,5 @@ google-genai
 tavily
 python-multipart
 edge-tts
+av
+numpy
