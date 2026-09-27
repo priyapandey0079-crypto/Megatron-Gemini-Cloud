@@ -52,9 +52,11 @@ TTS_VOICE = os.getenv(
 )
 
 gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(
+        timeout=60000
+    )
 )
-
 
 # ============================================================
 # APP
