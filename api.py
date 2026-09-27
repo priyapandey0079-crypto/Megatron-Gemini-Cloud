@@ -432,40 +432,76 @@ async def xiaozhi_websocket(websocket: WebSocket):
 
     print("[XIAOZHI WS] Connected")
 
-    # Initial Xiaozhi server handshake
-    hello = {
-        "type": "hello",
-        "version": 3,
-        "transport": "websocket",
-        "audio_params": {
-            "format": "opus",
-            "sample_rate": 16000,
-            "channels": 1,
-            "frame_duration": 60
-        }
-    }
-
-    await websocket.send_text(json.dumps(hello))
-    print("[XIAOZHI WS] Sent hello")
-
     try:
         while True:
             message = await websocket.receive()
 
+            # ------------------------------------------------
+            # TEXT / JSON
+            # ------------------------------------------------
             if message.get("text") is not None:
-                text = message["text"]
-                print("[XIAOZHI WS] TEXT:", text)
+                raw = message["text"]
 
+                print("[XIAOZHI WS] TEXT:", raw)
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    print("[XIAOZHI WS] Invalid JSON")
+                    continue
+
+                msg_type = data.get("type")
+
+                # ESP32 sends this FIRST.
+                if msg_type == "hello":
+                    session_id = f"megatron-{int(time.time() * 1000)}"
+
+                    server_hello = {
+                        "type": "hello",
+                        "transport": "websocket",
+                        "session_id": session_id,
+                        "audio_params": {
+                            "format": "opus",
+                            "sample_rate": 24000,
+                            "channels": 1,
+                            "frame_duration": 60
+                        }
+                    }
+
+                    await websocket.send_text(
+                        json.dumps(server_hello)
+                    )
+
+                    print(
+                        "[XIAOZHI WS] Sent server hello:",
+                        json.dumps(server_hello)
+                    )
+
+                else:
+                    print(
+                        f"[XIAOZHI WS] JSON type: {msg_type}"
+                    )
+
+            # ------------------------------------------------
+            # BINARY AUDIO
+            # ------------------------------------------------
             elif message.get("bytes") is not None:
                 audio = message["bytes"]
-                print(f"[XIAOZHI WS] AUDIO: {len(audio)} bytes")
+
+                print(
+                    f"[XIAOZHI WS] AUDIO: {len(audio)} bytes"
+                )
 
     except WebSocketDisconnect:
         print("[XIAOZHI WS] Client disconnected")
 
     except Exception as error:
         print("[XIAOZHI WS] Error:", error)
-            
+
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 # ============================================================
 # START
 # ============================================================
