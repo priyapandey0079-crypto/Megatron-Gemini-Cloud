@@ -6,7 +6,6 @@ from urllib.parse import quote
 
 import edge_tts
 import uvicorn
-from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from google import genai
