@@ -422,7 +422,6 @@ async def tts(text: str):
             "success": False,
             "error": str(error),
         }
-
 # ============================================================
 # XIAOZHI WEBSOCKET
 # ============================================================
@@ -431,48 +430,41 @@ async def tts(text: str):
 async def xiaozhi_websocket(websocket: WebSocket):
     await websocket.accept()
 
-    client = websocket.client
-    print(
-        f"[XIAOZHI WS] Connected: "
-        f"{client.host if client else 'unknown'}"
-    )
+    print("[XIAOZHI WS] Connected")
+
+    # Initial Xiaozhi server handshake
+    hello = {
+        "type": "hello",
+        "version": 3,
+        "transport": "websocket",
+        "audio_params": {
+            "format": "opus",
+            "sample_rate": 16000,
+            "channels": 1,
+            "frame_duration": 60
+        }
+    }
+
+    await websocket.send_text(json.dumps(hello))
+    print("[XIAOZHI WS] Sent hello")
 
     try:
         while True:
             message = await websocket.receive()
 
-            # Text message
             if message.get("text") is not None:
                 text = message["text"]
+                print("[XIAOZHI WS] TEXT:", text)
 
-                print("[XIAOZHI WS] TEXT:")
-                print(text)
-
-                # Keep connection alive for now.
-                # We will handle the exact Xiaozhi protocol next.
-                continue
-
-            # Binary audio message
-            if message.get("bytes") is not None:
+            elif message.get("bytes") is not None:
                 audio = message["bytes"]
-
-                print(
-                    f"[XIAOZHI WS] AUDIO: {len(audio)} bytes"
-                )
-
-                continue
+                print(f"[XIAOZHI WS] AUDIO: {len(audio)} bytes")
 
     except WebSocketDisconnect:
-        print("[XIAOZHI WS] Client disconnected.")
+        print("[XIAOZHI WS] Client disconnected")
 
     except Exception as error:
         print("[XIAOZHI WS] Error:", error)
-
-        try:
-            await websocket.close(code=1011)
-
-        except Exception:
-            pass
             
 # ============================================================
 # START
