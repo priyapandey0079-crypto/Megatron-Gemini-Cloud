@@ -29,7 +29,10 @@ if not GEMINI_API_KEY:
         "GEMINI_API_KEY or GOOGLE_API_KEY not found in environment variables."
     )
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash",
+)
 
 VOICE_MODELS = [
     model.strip()
@@ -59,7 +62,7 @@ gemini_client = genai.Client(
 
 app = FastAPI(
     title="Megatron Gemini API",
-    version="5.1.0",
+    version="5.2.0",
 )
 
 app.add_middleware(
@@ -93,9 +96,6 @@ Voice:
 - The user may speak Hindi, English, or Hinglish.
 - Understand natural speech and obvious transcription mistakes.
 - Clean obvious mistakes when the intended wording is clear.
-- Example: "capital gaya hai" -> "capital kya hai".
-- Example: "news farch" -> "news search".
-- Example: "system infomation" -> "system information".
 """.strip()
 
 
@@ -137,35 +137,27 @@ def is_temporary_gemini_error(error: Exception) -> bool:
 
 
 def generate_text(prompt: str) -> tuple[str, str]:
-    last_error = None
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+    result = clean_text(
+        getattr(response, "text", "")
+    )
+
+    if not result:
+        raise RuntimeError(
+            "Gemini returned an empty response."
         )
 
-        result = clean_text(
-            getattr(response, "text", "")
-        )
-
-        if not result:
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
-
-        return result, GEMINI_MODEL
-
-    except Exception as error:
-        last_error = error
-
-        if not is_temporary_gemini_error(error):
-            raise
-
-    raise last_error
+    return result, GEMINI_MODEL
 
 
-def generate_voice_response(audio_bytes: bytes) -> tuple[str, str, str]:
+def generate_voice_response(
+    audio_bytes: bytes,
+) -> tuple[str, str, str]:
+
     if not audio_bytes:
         raise ValueError(
             "Audio data is empty."
@@ -176,11 +168,9 @@ def generate_voice_response(audio_bytes: bytes) -> tuple[str, str, str]:
 
 You are receiving a short voice recording from the user.
 
-Do two things from the same audio:
-1. Understand and cleanly transcribe what the user intended to say.
-2. Answer the user's request as Megatron.
+Understand what the user said and answer the request.
 
-Return ONLY valid JSON with these exact keys:
+Return ONLY valid JSON with exactly these keys:
 
 {{
   "transcript": "cleaned user speech",
@@ -188,7 +178,7 @@ Return ONLY valid JSON with these exact keys:
 }}
 
 Do not output markdown.
-Do not output any extra text outside the JSON.
+Do not output anything outside the JSON.
 """.strip()
 
     last_error = None
@@ -244,11 +234,17 @@ Do not output any extra text outside the JSON.
                 data = json.loads(raw)
 
                 transcript = clean_text(
-                    data.get("transcript", "")
+                    data.get(
+                        "transcript",
+                        "",
+                    )
                 )
 
                 reply = clean_text(
-                    data.get("reply", "")
+                    data.get(
+                        "reply",
+                        "",
+                    )
                 )
 
                 if not transcript:
@@ -280,7 +276,7 @@ Do not output any extra text outside the JSON.
 
 
 # ============================================================
-# OPUS DECODER
+# OPUS -> WAV
 # ============================================================
 
 def decode_opus_to_wav(
@@ -311,13 +307,9 @@ def decode_opus_to_wav(
         if not opus_packet:
             continue
 
-        packet = av.Packet(
-            opus_packet
-        )
-
         try:
-            frames = decoder.decode(
-                packet
+            decoded_frames = decoder.decode(
+                av.Packet(opus_packet)
             )
         except Exception as error:
             print(
@@ -326,7 +318,7 @@ def decode_opus_to_wav(
             )
             continue
 
-        for frame in frames:
+        for frame in decoded_frames:
             try:
                 converted = resampler.resample(
                     frame
@@ -358,11 +350,9 @@ def decode_opus_to_wav(
                 )
 
     try:
-        remaining = decoder.decode(
-            None
-        )
+        decoded_frames = decoder.decode(None)
 
-        for frame in remaining:
+        for frame in decoded_frames:
             converted = resampler.resample(
                 frame
             )
@@ -396,10 +386,10 @@ def decode_opus_to_wav(
     if not pcm:
         return b""
 
-    wav_buffer = io.BytesIO()
+    buffer = io.BytesIO()
 
     with wave.open(
-        wav_buffer,
+        buffer,
         "wb",
     ) as wav:
         wav.setnchannels(1)
@@ -407,7 +397,7 @@ def decode_opus_to_wav(
         wav.setframerate(16000)
         wav.writeframes(pcm)
 
-    return wav_buffer.getvalue()
+    return buffer.getvalue()
 
 
 # ============================================================
@@ -462,7 +452,9 @@ async def generate_tts_opus(
             format="mp3",
         ) as container:
 
-            audio_stream = container.streams.audio[0]
+            audio_stream = (
+                container.streams.audio[0]
+            )
 
             resampler = av.audio.resampler.AudioResampler(
                 format="s16",
@@ -526,7 +518,9 @@ async def generate_tts_opus(
         offset = 0
 
         while offset < len(pcm):
-            remaining = len(pcm) - offset
+            remaining = (
+                len(pcm) - offset
+            )
 
             if remaining >= samples_per_packet:
                 chunk = pcm[
@@ -557,31 +551,209 @@ async def generate_tts_opus(
                 layout="mono",
             )
 
-            audio_frame.sample_rate = sample_rate
+            audio_frame.sample_rate = (
+                sample_rate
+            )
 
-            encoded_packets = encoder.encode(
+            for packet in encoder.encode(
                 audio_frame
-            )
+            ):
+                packets.append(
+                    bytes(packet)
+                )
 
-            packets.extend(
-                bytes(packet)
-                for packet in encoded_packets
-            )
-
-        final_packets = encoder.encode(
+        for packet in encoder.encode(
             None
-        )
-
-        packets.extend(
-            bytes(packet)
-            for packet in final_packets
-        )
+        ):
+            packets.append(
+                bytes(packet)
+            )
 
         return packets
 
     return await asyncio.to_thread(
         encode_opus
     )
+
+
+# ============================================================
+# XIAOZHI VOICE RESPONSE
+# ============================================================
+
+async def process_voice_utterance(
+    websocket: WebSocket,
+    packets: list[bytes],
+):
+
+    if not packets:
+        print(
+            "[XIAOZHI WS] No audio to process"
+        )
+        return
+
+    started = time.perf_counter()
+
+    try:
+        print(
+            "[XIAOZHI WS] Processing",
+            len(packets),
+            "Opus packets",
+        )
+
+        # ----------------------------------------------------
+        # OPUS -> WAV
+        # ----------------------------------------------------
+
+        wav_bytes = await asyncio.to_thread(
+            decode_opus_to_wav,
+            packets,
+        )
+
+        print(
+            "[XIAOZHI WS] Decoded WAV:",
+            len(wav_bytes),
+            "bytes",
+        )
+
+        if not wav_bytes:
+            raise RuntimeError(
+                "Opus decoding produced no audio."
+            )
+
+        # ----------------------------------------------------
+        # GEMINI
+        # ----------------------------------------------------
+
+        transcript, reply, model = (
+            await asyncio.to_thread(
+                generate_voice_response,
+                wav_bytes,
+            )
+        )
+
+        print(
+            "[STT]",
+            transcript,
+        )
+
+        print(
+            "[AI]",
+            reply,
+        )
+
+        print(
+            "[MODEL]",
+            model,
+        )
+
+        # ----------------------------------------------------
+        # TRANSCRIPT
+        # ----------------------------------------------------
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "stt",
+                    "text": transcript,
+                }
+            )
+        )
+
+        # ----------------------------------------------------
+        # TTS START
+        # ----------------------------------------------------
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "tts",
+                    "state": "start",
+                }
+            )
+        )
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "tts",
+                    "state": "sentence_start",
+                    "text": reply,
+                }
+            )
+        )
+
+        # ----------------------------------------------------
+        # EDGE TTS -> OPUS
+        # ----------------------------------------------------
+
+        response_packets = (
+            await generate_tts_opus(
+                reply,
+                sample_rate=24000,
+            )
+        )
+
+        print(
+            "[XIAOZHI WS] Sending",
+            len(response_packets),
+            "Opus response packets",
+        )
+
+        # ----------------------------------------------------
+        # SEND AUDIO TO ESP32
+        # ----------------------------------------------------
+
+        for packet in response_packets:
+            if packet:
+                await websocket.send_bytes(
+                    packet
+                )
+
+                await asyncio.sleep(
+                    0.001
+                )
+
+        # ----------------------------------------------------
+        # TTS STOP
+        # ----------------------------------------------------
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "tts",
+                    "state": "stop",
+                }
+            )
+        )
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        )
+
+        print(
+            f"[XIAOZHI WS] Response complete in {elapsed:.2f}s"
+        )
+
+    except Exception as error:
+        print(
+            "[XIAOZHI WS] VOICE ERROR:",
+            repr(error),
+        )
+
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "alert",
+                        "status": "error",
+                        "message": str(error),
+                        "emotion": "warning",
+                    }
+                )
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -593,7 +765,7 @@ def root():
     return {
         "service": "Megatron Gemini API",
         "status": "online",
-        "version": "5.1.0",
+        "version": "5.2.0",
     }
 
 
@@ -646,29 +818,13 @@ Answer naturally.
             prompt
         )
 
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        print(
-            f"[CHAT] {message}"
-        )
-
-        print(
-            f"[REPLY] {reply}"
-        )
-
-        print(
-            f"[MODEL] {model}"
-        )
-
         return {
             "success": True,
             "reply": reply,
             "model": model,
             "latency_seconds": round(
-                elapsed,
+                time.perf_counter()
+                - started,
                 3,
             ),
         }
@@ -698,47 +854,18 @@ def voice(
                 "error": "Audio data is empty.",
             }
 
-        print(
-            f"[VOICE] Received {len(audio)} bytes"
-        )
-
         transcript, reply, model = (
             generate_voice_response(
                 audio
             )
         )
 
-        tts_text = clean_tts_text(
-            reply
-        )
-
         tts_url = (
             "/tts?text="
             + quote(
-                tts_text,
+                clean_tts_text(reply),
                 safe="",
             )
-        )
-
-        elapsed = (
-            time.perf_counter()
-            - started
-        )
-
-        print(
-            f"[STT] {transcript}"
-        )
-
-        print(
-            f"[AI] {reply}"
-        )
-
-        print(
-            f"[VOICE MODEL] {model}"
-        )
-
-        print(
-            f"[TIMING] voice={elapsed:.3f}s"
         )
 
         return {
@@ -748,7 +875,8 @@ def voice(
             "tts_url": tts_url,
             "voice_model": model,
             "latency_seconds": round(
-                elapsed,
+                time.perf_counter()
+                - started,
                 3,
             ),
         }
@@ -785,16 +913,16 @@ async def tts(
             TTS_VOICE,
         )
 
-        audio_chunks = []
+        chunks = []
 
         async for chunk in communicator.stream():
             if chunk["type"] == "audio":
-                audio_chunks.append(
+                chunks.append(
                     chunk["data"]
                 )
 
         audio_data = b"".join(
-            audio_chunks
+            chunks
         )
 
         if not audio_data:
@@ -831,6 +959,7 @@ async def tts(
 async def xiaozhi_websocket(
     websocket: WebSocket,
 ):
+
     await websocket.accept()
 
     print(
@@ -838,25 +967,24 @@ async def xiaozhi_websocket(
     )
 
     audio_packets: list[bytes] = []
+
     session_id = None
     listening = False
+    processing = False
 
-    async def send_json(
-        data: dict,
-    ):
-        await websocket.send_text(
-            json.dumps(data)
-        )
+    # 100 × 60 ms = approximately 6 seconds.
+    MAX_UTTERANCE_PACKETS = 100
 
     try:
         while True:
             message = await websocket.receive()
 
             # ==================================================
-            # TEXT / JSON
+            # TEXT
             # ==================================================
 
             if message.get("text") is not None:
+
                 raw = message["text"]
 
                 print(
@@ -883,6 +1011,7 @@ async def xiaozhi_websocket(
                 # ------------------------------------------------
 
                 if msg_type == "hello":
+
                     session_id = (
                         f"megatron-{int(time.time() * 1000)}"
                     )
@@ -899,8 +1028,10 @@ async def xiaozhi_websocket(
                         },
                     }
 
-                    await send_json(
-                        server_hello
+                    await websocket.send_text(
+                        json.dumps(
+                            server_hello
+                        )
                     )
 
                     print(
@@ -915,6 +1046,7 @@ async def xiaozhi_websocket(
                 # ------------------------------------------------
 
                 elif msg_type == "listen":
+
                     state = data.get(
                         "state"
                     )
@@ -925,21 +1057,22 @@ async def xiaozhi_websocket(
                     )
 
                     if state == "start":
+
                         audio_packets.clear()
                         listening = True
+                        processing = False
 
                         print(
                             "[XIAOZHI WS] Recording started"
                         )
 
                     elif state == "stop":
-                        listening = False
 
-                        print(
-                            "[XIAOZHI WS] Recording stopped:",
-                            len(audio_packets),
-                            "packets",
-                        )
+                        if processing:
+                            continue
+
+                        listening = False
+                        processing = True
 
                         packets = list(
                             audio_packets
@@ -947,158 +1080,25 @@ async def xiaozhi_websocket(
 
                         audio_packets.clear()
 
-                        if not packets:
-                            print(
-                                "[XIAOZHI WS] No audio packets"
-                            )
-                            continue
+                        print(
+                            "[XIAOZHI WS] Recording stopped:",
+                            len(packets),
+                            "packets",
+                        )
 
-                        try:
-                            # ==========================================
-                            # OPUS -> WAV
-                            # ==========================================
+                        await process_voice_utterance(
+                            websocket,
+                            packets,
+                        )
 
-                            wav_bytes = await asyncio.to_thread(
-                                decode_opus_to_wav,
-                                packets,
-                            )
-
-                            print(
-                                "[XIAOZHI WS] Decoded WAV:",
-                                len(wav_bytes),
-                                "bytes",
-                            )
-
-                            if not wav_bytes:
-                                raise RuntimeError(
-                                    "Opus decoding produced no WAV."
-                                )
-
-                            # ==========================================
-                            # GEMINI
-                            # ==========================================
-
-                            transcript, reply, model = (
-                                await asyncio.to_thread(
-                                    generate_voice_response,
-                                    wav_bytes,
-                                )
-                            )
-
-                            print(
-                                "[STT]",
-                                transcript,
-                            )
-
-                            print(
-                                "[AI]",
-                                reply,
-                            )
-
-                            print(
-                                "[MODEL]",
-                                model,
-                            )
-
-                            # ==========================================
-                            # SEND TRANSCRIPT
-                            # ==========================================
-
-                            await send_json(
-                                {
-                                    "type": "stt",
-                                    "text": transcript,
-                                }
-                            )
-
-                            # ==========================================
-                            # TTS START
-                            # ==========================================
-
-                            await send_json(
-                                {
-                                    "type": "tts",
-                                    "state": "start",
-                                }
-                            )
-
-                            await send_json(
-                                {
-                                    "type": "tts",
-                                    "state": "sentence_start",
-                                    "text": reply,
-                                }
-                            )
-
-                            # ==========================================
-                            # EDGE TTS -> OPUS
-                            # ==========================================
-
-                            opus_packets = (
-                                await generate_tts_opus(
-                                    reply,
-                                    sample_rate=24000,
-                                )
-                            )
-
-                            print(
-                                "[XIAOZHI WS] Sending",
-                                len(opus_packets),
-                                "Opus response packets",
-                            )
-
-                            # ==========================================
-                            # STREAM AUDIO TO ESP32
-                            # ==========================================
-
-                            for packet in opus_packets:
-                                if packet:
-                                    await websocket.send_bytes(
-                                        packet
-                                    )
-
-                                    await asyncio.sleep(
-                                        0.001
-                                    )
-
-                            # ==========================================
-                            # TTS STOP
-                            # ==========================================
-
-                            await send_json(
-                                {
-                                    "type": "tts",
-                                    "state": "stop",
-                                }
-                            )
-
-                            print(
-                                "[XIAOZHI WS] Response complete"
-                            )
-
-                        except Exception as error:
-                            print(
-                                "[XIAOZHI WS] VOICE ERROR:",
-                                repr(error),
-                            )
-
-                            try:
-                                await send_json(
-                                    {
-                                        "type": "alert",
-                                        "status": "error",
-                                        "message": str(error),
-                                        "emotion": "warning",
-                                    }
-                                )
-                            except Exception:
-                                pass
+                        processing = False
 
                 # ------------------------------------------------
                 # ABORT
                 # ------------------------------------------------
 
                 elif msg_type == "abort":
+
                     print(
                         "[XIAOZHI WS] Abort received"
                     )
@@ -1106,11 +1106,8 @@ async def xiaozhi_websocket(
                     audio_packets.clear()
                     listening = False
 
-                # ------------------------------------------------
-                # OTHER JSON
-                # ------------------------------------------------
-
                 else:
+
                     print(
                         "[XIAOZHI WS] JSON type:",
                         msg_type,
@@ -1121,11 +1118,17 @@ async def xiaozhi_websocket(
             # ==================================================
 
             elif message.get("bytes") is not None:
+
                 audio = message[
                     "bytes"
                 ]
 
-                if audio and listening:
+                if (
+                    audio
+                    and listening
+                    and not processing
+                ):
+
                     audio_packets.append(
                         audio
                     )
@@ -1135,17 +1138,49 @@ async def xiaozhi_websocket(
                     )
 
                     if packet_count % 10 == 0:
+
                         print(
                             "[XIAOZHI WS] AUDIO packets:",
                             packet_count,
                         )
 
+                    # ------------------------------------------------
+                    # AUTOMATIC END OF UTTERANCE
+                    # ------------------------------------------------
+
+                    if (
+                        packet_count
+                        >= MAX_UTTERANCE_PACKETS
+                    ):
+
+                        print(
+                            "[XIAOZHI WS] Maximum utterance length reached"
+                        )
+
+                        listening = False
+                        processing = True
+
+                        packets = list(
+                            audio_packets
+                        )
+
+                        audio_packets.clear()
+
+                        await process_voice_utterance(
+                            websocket,
+                            packets,
+                        )
+
+                        processing = False
+
     except WebSocketDisconnect:
+
         print(
             "[XIAOZHI WS] Client disconnected"
         )
 
     except Exception as error:
+
         print(
             "[XIAOZHI WS] Error:",
             repr(error),
@@ -1164,6 +1199,7 @@ async def xiaozhi_websocket(
 # ============================================================
 
 if __name__ == "__main__":
+
     uvicorn.run(
         app,
         host="0.0.0.0",
