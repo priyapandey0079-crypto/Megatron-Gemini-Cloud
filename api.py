@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from google import genai
 from google.genai import types
+from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 
 
 # ============================================================
@@ -423,7 +424,57 @@ async def tts(text: str):
             "error": str(error),
         }
 
+# ============================================================
+# XIAOZHI WEBSOCKET
+# ============================================================
 
+@app.websocket("/xiaozhi")
+async def xiaozhi_websocket(websocket: WebSocket):
+    await websocket.accept()
+
+    client = websocket.client
+    print(
+        f"[XIAOZHI WS] Connected: "
+        f"{client.host if client else 'unknown'}"
+    )
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            # Text message
+            if message.get("text") is not None:
+                text = message["text"]
+
+                print("[XIAOZHI WS] TEXT:")
+                print(text)
+
+                # Keep connection alive for now.
+                # We will handle the exact Xiaozhi protocol next.
+                continue
+
+            # Binary audio message
+            if message.get("bytes") is not None:
+                audio = message["bytes"]
+
+                print(
+                    f"[XIAOZHI WS] AUDIO: {len(audio)} bytes"
+                )
+
+                continue
+
+    except WebSocketDisconnect:
+        print("[XIAOZHI WS] Client disconnected.")
+
+    except Exception as error:
+        print("[XIAOZHI WS] Error:", error)
+
+        try:
+            await websocket.close(code=1011)
+
+        except Exception:
+            pass
+            
 # ============================================================
 # START
 # ============================================================
