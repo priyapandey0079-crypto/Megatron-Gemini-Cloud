@@ -3,7 +3,12 @@ import os
 import re
 import time
 from urllib.parse import quote
+import asyncio
+import io
+import wave
 
+import av
+import numpy as np
 import edge_tts
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
@@ -432,13 +437,230 @@ async def xiaozhi_websocket(websocket: WebSocket):
 
     print("[XIAOZHI WS] Connected")
 
+    audio_packets = []
+    session_id = None
+
+    async def send_json(data: dict):
+        await websocket.send_text(json.dumps(data))
+
+    async def decode_opus_packets(packets: list[bytes]) -> bytes:
+        if not packets:
+            return b""
+
+        def decode():
+            decoder = av.CodecContext.create("opus", "r")
+            decoder.sample_rate = 16000
+            decoder.layout = "mono"
+            decoder.open()
+
+            resampler = av.audio.resampler.AudioResampler(
+                format="s16",
+                layout="mono",
+                rate=16000,
+            )
+
+            pcm_parts = []
+
+            for opus_packet in packets:
+                packet = av.Packet(opus_packet)
+
+                try:
+                    frames = decoder.decode(packet)
+                except Exception as error:
+                    print("[OPUS DECODE ERROR]", error)
+                    continue
+
+                for frame in frames:
+                    try:
+                        resampled = resampler.resample(frame)
+                    except Exception as error:
+                        print("[RESAMPLE ERROR]", error)
+                        continue
+
+                    if not isinstance(resampled, list):
+                        resampled = [resampled]
+
+                    for out_frame in resampled:
+                        array = out_frame.to_ndarray()
+
+                        if array.ndim > 1:
+                            array = array[0]
+
+                        pcm_parts.append(
+                            array.astype(np.int16).tobytes()
+                        )
+
+            try:
+                decoder.decode(None)
+            except Exception:
+                pass
+
+            pcm = b"".join(pcm_parts)
+
+            if not pcm:
+                return b""
+
+            wav_buffer = io.BytesIO()
+
+            with wave.open(wav_buffer, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(pcm)
+
+            return wav_buffer.getvalue()
+
+        return await asyncio.to_thread(decode)
+
+    async def generate_response_from_audio(wav_bytes: bytes):
+        if not wav_bytes:
+            raise RuntimeError("No decoded microphone audio.")
+
+        return await asyncio.to_thread(
+            generate_voice_response,
+            wav_bytes,
+        )
+
+    async def generate_tts_opus(text: str, sample_rate: int = 24000):
+        async def get_mp3():
+            communicator = edge_tts.Communicate(
+                clean_tts_text(text),
+                TTS_VOICE,
+            )
+
+            chunks = []
+
+            async for chunk in communicator.stream():
+                if chunk["type"] == "audio":
+                    chunks.append(chunk["data"])
+
+            return b"".join(chunks)
+
+        mp3_data = await get_mp3()
+
+        if not mp3_data:
+            raise RuntimeError("Edge TTS returned empty audio.")
+
+        def encode():
+            input_buffer = io.BytesIO(mp3_data)
+
+            with av.open(input_buffer, format="mp3") as container:
+                decoder_stream = container.streams.audio[0]
+
+                resampler = av.audio.resampler.AudioResampler(
+                    format="s16",
+                    layout="mono",
+                    rate=sample_rate,
+                )
+
+                pcm_frames = []
+
+                for frame in container.decode(
+                    decoder_stream
+                ):
+                    converted = resampler.resample(frame)
+
+                    if not isinstance(converted, list):
+                        converted = [converted]
+
+                    pcm_frames.extend(converted)
+
+            encoder = av.CodecContext.create("opus", "w")
+            encoder.sample_rate = sample_rate
+            encoder.layout = "mono"
+            encoder.open()
+
+            packets = []
+
+            samples_per_packet = (
+                sample_rate * 60 // 1000
+            )
+
+            pcm_buffer = np.empty(
+                0,
+                dtype=np.int16,
+            )
+
+            for frame in pcm_frames:
+                arr = frame.to_ndarray()
+
+                if arr.ndim > 1:
+                    arr = arr[0]
+
+                pcm_buffer = np.concatenate(
+                    (
+                        pcm_buffer,
+                        arr.astype(np.int16),
+                    )
+                )
+
+                while len(pcm_buffer) >= samples_per_packet:
+                    chunk = pcm_buffer[
+                        :samples_per_packet
+                    ]
+
+                    pcm_buffer = pcm_buffer[
+                        samples_per_packet:
+                    ]
+
+                    audio_frame = av.AudioFrame.from_ndarray(
+                        chunk.reshape(1, -1),
+                        format="s16",
+                        layout="mono",
+                    )
+
+                    audio_frame.sample_rate = sample_rate
+
+                    encoded = encoder.encode(
+                        audio_frame
+                    )
+
+                    packets.extend(
+                        bytes(packet)
+                        for packet in encoded
+                    )
+
+            if len(pcm_buffer) > 0:
+                padded = np.zeros(
+                    samples_per_packet,
+                    dtype=np.int16,
+                )
+
+                padded[:len(pcm_buffer)] = pcm_buffer
+
+                audio_frame = av.AudioFrame.from_ndarray(
+                    padded.reshape(1, -1),
+                    format="s16",
+                    layout="mono",
+                )
+
+                audio_frame.sample_rate = sample_rate
+
+                encoded = encoder.encode(
+                    audio_frame
+                )
+
+                packets.extend(
+                    bytes(packet)
+                    for packet in encoded
+                )
+
+            packets.extend(
+                bytes(packet)
+                for packet in encoder.encode(None)
+            )
+
+            return packets
+
+        return await asyncio.to_thread(encode)
+
     try:
         while True:
             message = await websocket.receive()
 
-            # ------------------------------------------------
+            # ==================================================
             # TEXT / JSON
-            # ------------------------------------------------
+            # ==================================================
             if message.get("text") is not None:
                 raw = message["text"]
 
@@ -452,9 +674,13 @@ async def xiaozhi_websocket(websocket: WebSocket):
 
                 msg_type = data.get("type")
 
-                # ESP32 sends this FIRST.
+                # --------------------------------------------------
+                # HELLO
+                # --------------------------------------------------
                 if msg_type == "hello":
-                    session_id = f"megatron-{int(time.time() * 1000)}"
+                    session_id = (
+                        f"megatron-{int(time.time() * 1000)}"
+                    )
 
                     server_hello = {
                         "type": "hello",
@@ -464,23 +690,217 @@ async def xiaozhi_websocket(websocket: WebSocket):
                             "format": "opus",
                             "sample_rate": 24000,
                             "channels": 1,
-                            "frame_duration": 60
-                        }
+                            "frame_duration": 60,
+                        },
                     }
 
-                    await websocket.send_text(
-                        json.dumps(server_hello)
-                    )
+                    await send_json(server_hello)
 
                     print(
                         "[XIAOZHI WS] Sent server hello:",
-                        json.dumps(server_hello)
+                        json.dumps(server_hello),
                     )
+
+                # --------------------------------------------------
+                # LISTEN
+                # --------------------------------------------------
+                elif msg_type == "listen":
+                    state = data.get("state")
+
+                    print(
+                        "[XIAOZHI WS] LISTEN STATE:",
+                        state,
+                    )
+
+                    if state == "start":
+                        audio_packets.clear()
+
+                        print(
+                            "[XIAOZHI WS] Recording started"
+                        )
+
+                    elif state == "stop":
+                        print(
+                            "[XIAOZHI WS] Recording stopped:",
+                            len(audio_packets),
+                            "packets",
+                        )
+
+                        if not audio_packets:
+                            print(
+                                "[XIAOZHI WS] No audio packets"
+                            )
+                            continue
+
+                        try:
+                            # ------------------------------------------
+                            # Decode Opus -> WAV
+                            # ------------------------------------------
+                            wav_bytes = (
+                                await decode_opus_packets(
+                                    audio_packets
+                                )
+                            )
+
+                            print(
+                                "[XIAOZHI WS] Decoded WAV:",
+                                len(wav_bytes),
+                                "bytes",
+                            )
+
+                            if not wav_bytes:
+                                raise RuntimeError(
+                                    "Opus decoding produced no WAV."
+                                )
+
+                            # ------------------------------------------
+                            # Gemini STT + response
+                            # ------------------------------------------
+                            transcript, reply, model = (
+                                await generate_response_from_audio(
+                                    wav_bytes
+                                )
+                            )
+
+                            print(
+                                "[STT]",
+                                transcript,
+                            )
+                            print(
+                                "[AI]",
+                                reply,
+                            )
+                            print(
+                                "[MODEL]",
+                                model,
+                            )
+
+                            # ------------------------------------------
+                            # Send transcript
+                            # ------------------------------------------
+                            await send_json(
+                                {
+                                    "type": "stt",
+                                    "text": transcript,
+                                }
+                            )
+
+                            # ------------------------------------------
+                            # Start TTS
+                            # ------------------------------------------
+                            await send_json(
+                                {
+                                    "type": "tts",
+                                    "state": "start",
+                                }
+                            )
+
+                            await send_json(
+                                {
+                                    "type": "tts",
+                                    "state": "sentence_start",
+                                    "text": reply,
+                                }
+                            )
+
+                            # ------------------------------------------
+                            # Edge TTS -> Opus
+                            # ------------------------------------------
+                            opus_packets = (
+                                await generate_tts_opus(
+                                    reply,
+                                    sample_rate=24000,
+                                )
+                            )
+
+                            print(
+                                "[XIAOZHI WS] Sending",
+                                len(opus_packets),
+                                "Opus response packets",
+                            )
+
+                            # ------------------------------------------
+                            # Stream Opus to ESP32
+                            # ------------------------------------------
+                            for packet in opus_packets:
+                                if packet:
+                                    await websocket.send_bytes(
+                                        packet
+                                    )
+
+                            # ------------------------------------------
+                            # TTS stop
+                            # ------------------------------------------
+                            await send_json(
+                                {
+                                    "type": "tts",
+                                    "state": "stop",
+                                }
+                            )
+
+                        except Exception as error:
+                            print(
+                                "[XIAOZHI WS] VOICE ERROR:",
+                                repr(error),
+                            )
+
+                            await send_json(
+                                {
+                                    "type": "alert",
+                                    "status": "error",
+                                    "message": str(error),
+                                    "emotion": "warning",
+                                }
+                            )
+
+                        finally:
+                            audio_packets.clear()
+
+                # --------------------------------------------------
+                # ABORT
+                # --------------------------------------------------
+                elif msg_type == "abort":
+                    print(
+                        "[XIAOZHI WS] Abort received"
+                    )
+
+                    audio_packets.clear()
 
                 else:
                     print(
                         f"[XIAOZHI WS] JSON type: {msg_type}"
                     )
+
+            # ==================================================
+            # BINARY AUDIO
+            # ==================================================
+            elif message.get("bytes") is not None:
+                audio = message["bytes"]
+
+                if audio:
+                    audio_packets.append(audio)
+
+                    if len(audio_packets) % 10 == 0:
+                        print(
+                            "[XIAOZHI WS] AUDIO packets:",
+                            len(audio_packets),
+                        )
+
+    except WebSocketDisconnect:
+        print(
+            "[XIAOZHI WS] Client disconnected"
+        )
+
+    except Exception as error:
+        print(
+            "[XIAOZHI WS] Error:",
+            repr(error),
+        )
+
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
 
             # ------------------------------------------------
             # BINARY AUDIO
